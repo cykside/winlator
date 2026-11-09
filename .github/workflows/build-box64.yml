@@ -1,0 +1,96 @@
+name: Build Box64 (aarch64 glibc, Cortex-A76 tuned)
+
+on:
+  workflow_dispatch:
+    inputs:
+      box64_ref:
+        description: "Box64 git ref (branch, tag or commit), e.g. main or v0.3.6"
+        required: true
+        default: "main"
+      cpu_flags:
+        description: "Extra compiler flags tuned for the target CPU"
+        required: true
+        default: "-mcpu=cortex-a76 -O3"
+      sd845:
+        description: "Enable Box64 SD845 option (Snapdragon-tuned dynarec)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Ubuntu 22.04 ships glibc 2.35. Building on a newer distro can produce a
+    # binary that needs glibc symbols missing from the Winlator rootfs.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            cmake ninja-build python3 git
+
+      - name: Clone Box64
+        run: |
+          git clone https://github.com/ptitSeb/box64.git
+          cd box64
+          git checkout "${{ inputs.box64_ref }}"
+          echo "BOX64_COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Configure
+        working-directory: box64
+        run: |
+          SD_FLAG=OFF
+          if [ "${{ inputs.sd845 }}" = "true" ]; then SD_FLAG=ON; fi
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DARM_DYNAREC=ON \
+            -DSD845=$SD_FLAG \
+            -DCMAKE_C_FLAGS="${{ inputs.cpu_flags }}" \
+            -DCMAKE_CXX_FLAGS="${{ inputs.cpu_flags }}"
+
+      - name: Build
+        working-directory: box64
+        run: cmake --build build --parallel
+
+      - name: Inspect the binary
+        working-directory: box64/build
+        run: |
+          aarch64-linux-gnu-strip -o box64.stripped box64
+          file box64.stripped
+          ls -lh box64 box64.stripped
+          echo "Highest glibc symbol version required (Winlator rootfs must provide it):"
+          aarch64-linux-gnu-objdump -T box64.stripped \
+            | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -3
+
+      - name: Package
+        run: |
+          OUT="box64-${BOX64_COMMIT}-a76"
+          mkdir -p "$OUT"
+          cp box64/build/box64.stripped "$OUT/box64"
+          cp box64/LICENSE "$OUT/" 2>/dev/null || true
+          tar -cJf "$OUT.tar.xz" "$OUT"
+          echo "ARCHIVE=$OUT.tar.xz" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: box64-${{ env.BOX64_COMMIT }}-a76
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: box64-${{ env.BOX64_COMMIT }}-run${{ github.run_number }}
+          name: Box64 ${{ env.BOX64_COMMIT }} (Cortex-A76)
+          prerelease: true
+          files: ${{ env.ARCHIVE }}
