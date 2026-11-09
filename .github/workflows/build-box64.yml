@@ -11,6 +11,10 @@ on:
         description: "Extra compiler flags tuned for the target CPU"
         required: true
         default: "-mcpu=cortex-a76 -O3"
+      base_package:
+        description: "Existing package in installable_components/box64/ used as the layout template"
+        required: true
+        default: "box64-0.4.5.tzst"
       sd845:
         description: "Enable Box64 SD845 option (Snapdragon-tuned dynarec)"
         type: boolean
@@ -27,12 +31,18 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - name: Install cross toolchain
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Install cross toolchain and packaging tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            cmake ninja-build python3 git
+            cmake ninja-build python3 git zstd jq
 
       - name: Clone Box64
         run: |
@@ -71,20 +81,64 @@ jobs:
           aarch64-linux-gnu-objdump -T box64.stripped \
             | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -3
 
-      - name: Package
+      - name: Package raw binary (.tar.xz)
         run: |
           OUT="box64-${BOX64_COMMIT}-a76"
-          mkdir -p "$OUT"
-          cp box64/build/box64.stripped "$OUT/box64"
-          cp box64/LICENSE "$OUT/" 2>/dev/null || true
-          tar -cJf "$OUT.tar.xz" "$OUT"
-          echo "ARCHIVE=$OUT.tar.xz" >> "$GITHUB_ENV"
+          mkdir -p "raw/$OUT"
+          cp box64/build/box64.stripped "raw/$OUT/box64"
+          cp box64/LICENSE "raw/$OUT/" 2>/dev/null || true
+          tar -C raw -cJf "$OUT.tar.xz" "$OUT"
 
-      - name: Upload artifact
+      # Unpack an existing Winlator package, swap in the new binary and repack
+      # it with the same layout, so we do not need to know the internal format.
+      - name: Repack as Winlator package (.tzst)
+        run: |
+          BASE="installable_components/box64/${{ inputs.base_package }}"
+          if [ ! -f "$BASE" ]; then
+            echo "::error::Base package not found: $BASE"
+            ls -la installable_components/box64 || true
+            exit 1
+          fi
+
+          rm -rf pkg && mkdir pkg
+          tar --zstd -xf "$BASE" -C pkg
+          echo "Base package layout:"
+          (cd pkg && find . \( -type f -o -type l \) | sort)
+
+          TARGETS=$(find pkg -type f -name box64)
+          if [ -z "$TARGETS" ]; then
+            echo "::error::No file named 'box64' found inside the base package."
+            exit 1
+          fi
+          for T in $TARGETS; do
+            echo "Replacing $T"
+            cp box64/build/box64.stripped "$T"
+            chmod 755 "$T"
+          done
+
+          # If the package carries a profile.json, show it and bump the version name.
+          PROFILE=$(find pkg -type f -name profile.json | head -1)
+          if [ -n "$PROFILE" ]; then
+            echo "profile.json before:"; cat "$PROFILE"
+            jq --arg v "${BOX64_COMMIT}-a76" \
+              'if has("versionName") then .versionName = $v else . end' \
+              "$PROFILE" > "$PROFILE.new" && mv "$PROFILE.new" "$PROFILE"
+            echo "profile.json after:"; cat "$PROFILE"
+          fi
+
+          PKG="box64-${BOX64_COMMIT}-a76.tzst"
+          tar --owner=0 --group=0 --numeric-owner -C pkg -cf - . | zstd -19 -T0 -o "$PKG"
+          ls -lh "$PKG"
+          echo "PKG=$PKG" >> "$GITHUB_ENV"
+          echo "RAW=box64-${BOX64_COMMIT}-a76.tar.xz" >> "$GITHUB_ENV"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: box64-${{ env.BOX64_COMMIT }}-a76
-          path: ${{ env.ARCHIVE }}
+          path: |
+            ${{ env.PKG }}
+            ${{ env.RAW }}
           if-no-files-found: error
 
       - name: Publish GitHub Release
@@ -93,4 +147,6 @@ jobs:
           tag_name: box64-${{ env.BOX64_COMMIT }}-run${{ github.run_number }}
           name: Box64 ${{ env.BOX64_COMMIT }} (Cortex-A76)
           prerelease: true
-          files: ${{ env.ARCHIVE }}
+          files: |
+            ${{ env.PKG }}
+            ${{ env.RAW }}
