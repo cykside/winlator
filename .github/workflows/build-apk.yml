@@ -139,9 +139,37 @@ jobs:
             **/build/reports/**
           if-no-files-found: ignore
 
-      - name: Publish GitHub Release (tag pushes only)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Prepare release tag and files
+        id: rel
+        if: github.event_name != 'pull_request'
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            PRERELEASE=false
+          else
+            TAG="build-${GITHUB_RUN_NUMBER}-${SHORT_SHA}"
+            PRERELEASE=true
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+          # Copy every built APK into one folder with a clear name.
+          mkdir -p release
+          find . -path "*build/outputs/apk/*" -name "*.apk" -not -path "./release/*" | while read -r APK; do
+            BASE=$(basename "$APK" .apk)
+            cp "$APK" "release/Winlator-${TAG}-${BASE}.apk"
+          done
+          ls -lh release
+
+      - name: Publish GitHub Release
+        if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            **/build/outputs/apk/**/*.apk
+          tag_name: ${{ steps.rel.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Winlator ${{ steps.rel.outputs.tag }}
+          prerelease: ${{ steps.rel.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release/*.apk
