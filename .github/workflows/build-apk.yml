@@ -36,6 +36,14 @@ jobs:
           git submodule update --init --recursive --depth 1 \
             || git submodule update --init --recursive
 
+      # The GitHub web editor cannot move a submodule pointer, so build the
+      # newest commit of the branch set in .gitmodules (branch = main).
+      - name: Use the latest commit of the app submodule branch
+        run: |
+          git submodule update --remote --depth 1 app \
+            || echo "::warning::Could not update app to the branch head, using the pinned commit"
+          git -C app log -1 --oneline || true
+
       - name: Verify submodules are populated
         run: |
           git submodule status
